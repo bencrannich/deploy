@@ -1,0 +1,95 @@
+#! /bin/sh
+
+status=0
+me='deploy'
+here="$(pwd)"
+repo="$(cd $(git rev-parse --git-dir) && pwd)"
+unset GIT_DIR
+
+printf "%s: repository is %s\n" "$me" "$repo" >&2
+
+deploy_cutover() {
+	rev=$(git rev-parse "$3") || return
+	name=$(echo $rev | cut -c1-7)
+	prefix=$(GIT_DIR="$repo" git config --get deploy.$3.prefix)
+	suffix=$(GIT_DIR="$repo" git config --get deploy.$3.suffix)
+	target="$prefix$name$suffix"
+	[ -d "$2" ] || mkdir -p "$2" || return
+	current="$(cd $2 && readlink current 2>/dev/null)"
+	if ! [ -z "$current" ] ; then
+		if ! [ -d "$2/$current" ] ; then
+			printf "%s: WARNING: current deployment of branch %s (%s) is missing\n" "$me" "$3" "$current" >&2
+			status=$(($status + 1))
+			rm -f "$3/current"
+			current=""
+		fi
+	fi
+	if ! [ -d "$2/$target" ] ; then
+		printf "%s: checking out branch %s to %s\n" "$me" "$3" "$target" >&2
+		cd "$2" && \
+			git clone --recurse-submodules -b "$3" -- "$1" "$target" || return
+		cd "$target" && \
+			git config --add --type=bool advice.detachedHead false && \
+			git checkout "$rev" || return
+		cd .. && rm -f current && ln -s $target current || return
+	fi
+	if ! [ -z "$current" ] ; then
+		prev=$(readlink prev 2>/dev/null)
+		if ! [ -z "$prev" ] && [ -d "$prev" ] ; then
+			printf "%s: removing old deployment %s...\n" "$me" "$prev" >&2
+			rm -rf "$prev"
+		fi
+		rm -f prev && ln -s "$current" prev
+	fi
+	newhooks=""
+	oldhooks=""
+	if [ -d "$target/.deploy" ] ; then
+		newhooks="$2/$target/.deploy"
+	fi
+	if ! [ -z "$current" ] && [ -d "$current/.deploy" ] ; then
+		oldhooks="$2/$current/.deploy"
+	fi
+	printf "%s: restarting services using hooks from %s\n" "$me" "$newhooks" >&2
+	printf "%s: (previous deployment hooks in %s)\n" "$me" "$oldhooks" >&2
+	if ! [ -z "$current" ] && [ -x "$newhooks/upgrade" ] ; then
+		printf "%s: invoking upgrade hook for branch %s\n" "$me" "$3" >&2
+		cd "$2/$target" && "$newhooks/upgrade" "$current"
+		return
+	fi
+	if ! [ -z "$current" ] && [ -x "$oldhooks/stop" ] ; then
+		printf "%s: stopping previous instance %s\n" "$me" "$current" >&2
+		cd "$2/$current" && "$oldhooks/stop"
+	fi
+	if [ -x "$newhooks/start" ] ; then
+		printf "%s: starting instance %s\n" "$me" "$target" >&2
+		cd "$2/$target" && "$newhooks/start"
+	fi
+}
+
+branches=$(GIT_DIR="$repo" git config --list --name-only | grep -e "^deploy\." | cut -f2 -d. | uniq)
+for branch in $branches ; do
+	cd "$here" || exit
+	root=$(GIT_DIR="$repo" git config --get deploy.${branch}.root)
+	mode=$(GIT_DIR="$repo" git config --get deploy.${branch}.mode)
+	if [ -z "$root" ] ; then
+		printf "%s: WARNING: branch %s is named but does not have a root path configured\n" "$me" "$branch" >&2
+		status=$(($status + 1))
+		continue
+	fi
+	if [ -z "$mode" ] ; then
+		printf "%s: no mode specified for branch %s, defaulting to cutover\n" "$me" "$branch" >&2
+		mode=cutover
+	fi
+	case $mode in
+		cutover)
+			deploy_cutover "$repo" "$root" "$branch" || status=$(($status + 1))
+			;;
+		*)
+			printf "%s: ERROR: mode %s specified for branch %s is not supported\n" "$me" "$mode" "$branch" >&2
+			status=$(($status + 1))
+			;;
+	esac
+
+done
+
+exit $status
