@@ -1,5 +1,10 @@
 #! /bin/sh
 
+##############################################################################
+## This script is a post-receive hook for maintaining Git-based service     ##
+## deployments                                                              ##
+##############################################################################
+
 status=0
 me='deploy'
 here="$(pwd)"
@@ -8,6 +13,7 @@ unset GIT_DIR
 
 printf "%s: repository is %s\n" "$me" "$repo" >&2
 
+# deploy_cutover repo-path deploy-path branch-name
 deploy_cutover() {
 	rev=$(git rev-parse "$3") || return
 	name=$(echo $rev | cut -c1-7)
@@ -15,38 +21,51 @@ deploy_cutover() {
 	suffix=$(GIT_DIR="$repo" git config --get deploy.$3.suffix)
 	target="$prefix$name$suffix"
 	[ -d "$2" ] || mkdir -p "$2" || return
-	current="$(cd $2 && readlink current 2>/dev/null)"
-	if ! [ -z "$current" ] ; then
-		if ! [ -d "$2/$current" ] ; then
-			printf "%s: WARNING: current deployment of branch %s (%s) is missing\n" "$me" "$3" "$current" >&2
-			status=$(($status + 1))
-			rm -f "$3/current"
-			current=""
-		fi
+	curlinkname="current"
+	prevlinkname="prev"
+	current="$(cd $2 && readlink $curlinkname 2>/dev/null)"
+	fresh=no
+	if [ "$current" != "" ] && ! [ -d "$2/$current" ] ; then
+		printf "%s: WARNING: current deployment of branch %s (%s) is missing\n" "$me" "$3" "$current" >&2
+		status=$(($status + 1))
+		rm -f "$2/$curlinkname"
+		current=""
 	fi
 	if ! [ -d "$2/$target" ] ; then
-		printf "%s: checking out branch %s to %s\n" "$me" "$3" "$target" >&2
+		fresh=yes
+		printf "%s: checking out commit %s (for branch %s) to %s\n" "$me" "$rev" "$3" "$target" >&2
 		cd "$2" && \
 			git clone --recurse-submodules -b "$3" -- "$1" "$target" || return
 		cd "$target" && \
 			git config --add --type=bool advice.detachedHead false && \
-			git checkout "$rev" || return
-		cd .. && rm -f current && ln -s $target current || return
+			git checkout -q "$rev" || return
+		cd .. && rm -f "$curlinkname" && ln -s "$target" "$curlinkname" || return
+		printf "%s: 'current' deployment is now %s\n" "$me" "$target" >&2
+		
 	fi
-	if ! [ -z "$current" ] ; then
-		prev=$(readlink prev 2>/dev/null)
-		if ! [ -z "$prev" ] && [ -d "$prev" ] ; then
+	if [ "$current" != "" ] && [ "$current" != "$target" ] ; then
+		# if there's a "prev" link, remove the (old) tree it points to before
+		# creating a new link pointing at the tree that was current before
+		# we did anything
+		prev=$(readlink "$prevlinkname" 2>/dev/null)
+		if ! [ -z "$prev" ] && [ "$prev" != "$current" ] && [ "$prev" != "$target" ] && [ -d "$prev" ] ; then
 			printf "%s: removing old deployment %s...\n" "$me" "$prev" >&2
 			rm -rf "$prev"
 		fi
-		rm -f prev && ln -s "$current" prev
+		printf "%s: 'previous' deployment is now %s\n" "$me" "$current" >&2
+		rm -f "$prevlinkname" && ln -s "$current" "$prevlinkname"
+	fi
+	if [ "$fresh" = no ] ; then
+		# if we didn't check out a new tree, then there's nothing further
+		# to do
+		return
 	fi
 	newhooks=""
 	oldhooks=""
 	if [ -d "$target/.deploy" ] ; then
 		newhooks="$2/$target/.deploy"
 	fi
-	if ! [ -z "$current" ] && [ -d "$current/.deploy" ] ; then
+	if [ "$current" != "" ] && [ -d "$current/.deploy" ] ; then
 		oldhooks="$2/$current/.deploy"
 	fi
 	printf "%s: restarting services using hooks from %s\n" "$me" "$newhooks" >&2
@@ -65,6 +84,9 @@ deploy_cutover() {
 		cd "$2/$target" && "$newhooks/start"
 	fi
 }
+
+# iterate all configured deployment branches, passing the key details to
+# the deploy_xxx function relevant to that branch's deployment mode
 
 branches=$(GIT_DIR="$repo" git config --list --name-only | grep -e "^deploy\." | cut -f2 -d. | uniq)
 for branch in $branches ; do
