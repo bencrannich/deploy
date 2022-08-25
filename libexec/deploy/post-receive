@@ -104,7 +104,7 @@ for branch in $branches ; do
 	fi
 	case $mode in
 		cutover)
-			deploy_cutover "$repo" "$root" "$branch" || status=$(($status + 1))
+			deploy_cutover "$repo" "$root" "$branch" || status=$(($status + 1))
 			;;
 		*)
 			printf "%s: ERROR: mode %s specified for branch %s is not supported\n" "$me" "$mode" "$branch" >&2
